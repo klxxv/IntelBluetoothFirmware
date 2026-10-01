@@ -1,56 +1,113 @@
 name: CI
 
-on: [push, pull_request, workflow_dispatch]
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
-
   build:
-
-    runs-on: macos-latest
+    name: Build and verify x86_64 kexts
+    runs-on: macos-15-intel
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
 
     steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
-    - uses: actions/checkout@v4
+      - name: Install MacKernelSDK
+        uses: actions/checkout@v4
+        with:
+          repository: acidanthera/MacKernelSDK
+          ref: 3f750085caa17ec3a7880f11c11bf4f48cd6a164
+          path: MacKernelSDK
+          persist-credentials: false
 
-    - name: Get Lilu SHA
-      id: get-lilu-sha
-      run: |
-        echo "hash=$(git ls-remote https://github.com/acidanthera/Lilu.git HEAD | awk '{ print $1 }')" >> "$GITHUB_OUTPUT"
+      - name: Install Lilu source
+        uses: actions/checkout@v4
+        with:
+          repository: acidanthera/Lilu
+          ref: 0515f40b7f2a096adc85e832a4c6104fbd07f936
+          path: Lilu
+          persist-credentials: false
 
-    - name: Cache Lilu
-      id: cache-lilu
-      uses: actions/cache@v4
-      with:
-        path: Lilu.kext
-        key: Lilu-${{ steps.get-lilu-sha.outputs.hash }}
+      - name: Build Lilu SDK
+        working-directory: Lilu
+        run: |
+          ln -s ../MacKernelSDK MacKernelSDK
+          xcodebuild -configuration Debug -arch x86_64 CODE_SIGNING_ALLOWED=NO build
+          test -f build/Debug/Lilu.kext/Contents/Resources/Library/plugin_start.cpp
+          cp -R build/Debug/Lilu.kext ../
+          test -f ../Lilu.kext/Contents/Resources/Headers/kern_api.hpp
 
-    - name: Install MacKernelSDK
-      run: |
-        git clone --depth=1 https://github.com/acidanthera/MacKernelSDK.git
+      - name: Build Debug and Release
+        run: |
+          xcodebuild -version
+          for configuration in Debug Release; do
+            xcodebuild -project IntelBluetoothFirmware.xcodeproj \
+              -target IntelBTPatcher -target IntelBluetoothFirmware -target IntelBluetoothInjector \
+              -configuration "$configuration" -arch x86_64 \
+              SYMROOT="$PWD/build" CODE_SIGNING_ALLOWED=NO build \
+              2>&1 | tee "build-$configuration.log"
+          done
 
-    - name: Install Lilu SDK
-      if: steps.cache-lilu.outputs.cache-hit != 'true'
-      run: |
-        git clone --depth=1 https://github.com/acidanthera/Lilu.git
-        cd Lilu || exit 1
-        ln -s ../MacKernelSDK MacKernelSDK
-        xcodebuild -configuration Debug -arch x86_64 | xcpretty && ret=${PIPESTATUS[0]}
-        if [[ $ret -ne 0 || ! -d build/Debug/Lilu.kext ]]; then
-          exit 1
-        fi
-        cp -R build/Debug/Lilu.kext ../
+      - name: Verify and package kexts
+        run: |
+          mkdir -p dist
+          for configuration in Debug Release; do
+            package="IntelBluetoothFirmware-$configuration"
+            mkdir -p "dist/$package"
+            for name in IntelBTPatcher IntelBluetoothFirmware IntelBluetoothInjector; do
+              kext="build/$configuration/$name.kext"
+              test -d "$kext"
+              plutil -lint "$kext/Contents/Info.plist"
+              if [[ "$name" != IntelBluetoothInjector ]]; then
+                binary="$kext/Contents/MacOS/$name"
+                test -s "$binary"
+                file "$binary"
+                test "$(lipo -archs "$binary")" = x86_64
+              fi
+              ditto "$kext" "dist/$package/$name.kext"
+            done
+            cp LICENSE iwlwifi-firmware-license "dist/$package/"
+            {
+              echo "Repository: $GITHUB_REPOSITORY"
+              echo "Source commit: $GITHUB_SHA"
+              echo "Configuration: $configuration"
+              echo "Architecture: x86_64"
+              echo "Lilu SDK commit: $(git -C Lilu rev-parse HEAD)"
+              echo "MacKernelSDK commit: $(git -C MacKernelSDK rev-parse HEAD)"
+              echo "IntelBTPatcher version: $(/usr/libexec/PlistBuddy -c 'Print CFBundleVersion' build/$configuration/IntelBTPatcher.kext/Contents/Info.plist)"
+              xcodebuild -version
+              echo "Compiled and structurally verified; not runtime-tested on hardware."
+            } > "dist/$package/BUILD-INFO.txt"
+            ditto -c -k --sequesterRsrc --keepParent "dist/$package" "dist/$package.zip"
+            unzip -t "dist/$package.zip"
+          done
+          (cd dist && shasum -a 256 *.zip > SHA256SUMS.txt)
 
-    - name: Debug Build
-      run: |
-        xcodebuild -alltargets -configuration Debug | xcpretty && exit ${PIPESTATUS[0]}
+      - name: Upload downloadable kext packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: IntelBluetoothFirmware-kexts-${{ github.sha }}
+          path: |
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
 
-    - name: Release Build
-      run: |
-        xcodebuild -alltargets -configuration Release | xcpretty && exit ${PIPESTATUS[0]}
-
-    - name: Upload to Artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: ${{ github.event.repository.name }}
-        path: build/*/*.zip
-        if-no-files-found: error
+      - name: Upload build logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ github.sha }}
+          path: build-*.log
+          if-no-files-found: ignore
+          retention-days: 7
